@@ -8,7 +8,7 @@ reviewers:
 approvers:
   - TBD
 creation-date: 2026-06-17
-last-updated: 2026-06-22
+last-updated: 2026-07-23
 status: provisional
 see-also:
   - "/enhancements/kai/agent-driven-migration/README.md"
@@ -595,7 +595,7 @@ When adding agent runtimes that do not implement ACP-over-HTTP
 (OpenCode, Claude, etc.), the harness adds a stdio-to-HTTP bridge.
 The external interface is identical regardless of runtime.
 
-See [ADR 0002: ACP Transport and Agent Observability](docs/adr/0002-acp-transport-and-observability.md)
+See [ADR 0002: ACP Transport and Agent Observability](https://github.com/konveyor/agentic-controller/blob/main/docs/adr/0002-acp-transport-and-observability.md)
 for the full design.
 
 ### User Stories
@@ -721,21 +721,237 @@ and handles clone, branch, commit, push. It also reads LLM
 credentials from env vars set via `envFrom` and configures the
 agent runtime accordingly.
 
-#### UI access via Hub passthrough
+#### Hub integration
 
-The UI accesses CRDs through Hub's existing service passthrough
-pattern (`ServiceHandler.Forward`). Hub proxies requests to the
-Kubernetes API server using its service account token and provides
-RBAC scope checking. The UI does not need a separate `/k8s` proxy
-route — all traffic flows through Hub.
+Hub's integration with the agent platform follows the established
+addon pattern. The controller sits in the middle as a
+domain-agnostic orchestrator. To the left, Hub and the UI handle
+Konveyor-specific concerns (applications, credentials, migration
+workflows). To the right, the harness in the base image handles
+runtime resolution and git lifecycle. The controller does not know
+about either side — it passes env vars and envFrom through without
+interpretation.
 
-This is the POC approach. The long-term API surface (whether Hub
-should expose curated REST endpoints for agent resources instead
-of raw k8s API passthrough) is left for future investigation.
-Trade-offs to evaluate include: k8s API conventions vs Hub
-conventions, privilege escalation via Hub's SA, and cross-plane
-data joining (agent resources in etcd, application data in Hub's
-DB).
+```text
+Hub / UI                   Controller               Harness / Runtime
+(domain-specific)          (domain-agnostic)         (domain-specific)
+
+Konveyor UI ──┐                                   ┌── Konveyor harness
+              ├──► AgentRun CR ──► Sandbox ──►─────┤   (Hub client, git)
+Hub (CRUD +   │                                    │
+ Task + token)┘                                    └── Custom harness
+                                                       (other platforms)
+CLI / GitOps ─────► AgentRun CR ──► Sandbox ──►──── Standalone harness
+                                                    (no Hub needed)
+```
+
+Nothing stops another platform from providing its own UI, its own
+harness, and using the same controller and CRDs for a completely
+different use case.
+
+##### Hub's responsibilities
+
+**CRUD for agent CRDs.** Hub exposes REST endpoints for agent
+resources (Agent, SkillCard, SkillCollection, LLMProvider,
+AgentRun, AgentPlaybook, AgentPlaybookRun) using its
+controller-runtime client — the same pattern as `AddonHandler`
+and `ConfigMapHandler`. CRDs in etcd are the sole source of
+truth; Hub does not store copies in its database. All reads are
+request-driven (`client.List()`, `client.Get()`) with no informer
+cache — the number of agent resources is small (tens, not
+thousands).
+
+When listing Agents and AgentPlaybooks for the UI, Hub filters by
+`konveyor.io/managed=true`. All other resource types (SkillCards,
+SkillCollections, LLMProviders, AgentRuns, AgentPlaybookRuns) are
+listed unfiltered. Resources without the managed label remain
+usable via kubectl and other consumers.
+
+**Task row at AgentRun create time.** When Hub receives a create
+request for an AgentRun (or AgentPlaybookRun), it follows the
+same pattern as addon task creation:
+
+1. Creates a lightweight Task row in its database containing the
+   application reference and run metadata — the same mechanism
+   that addon tasks use
+2. Mints a scoped API token via `auth.IdP.TaskGrant()` with
+   `AddonScopes` (including `applications:get`,
+   `identities:decrypt`) — the same scopes addons receive
+3. Stores the token in a Kubernetes Secret
+4. Adds `TASK`, `HUB_BASE_URL`, and the token Secret to the
+   AgentRun's `spec.env` and `spec.envFrom`
+5. Creates the AgentRun CR via `client.Create()`
+
+Hub does **not** resolve application metadata, git URLs, branches,
+or credentials at create time. This is the key difference from the
+earlier smart-endpoint approach and is consistent with how addon
+tasks work — the thing-in-the-pod resolves what it needs at
+runtime.
+
+For AgentPlaybookRuns, Hub creates one Task row for the playbook
+run. The controller propagates the `TASK`, `HUB_BASE_URL`, and
+token env vars from the AgentPlaybookRun to each child AgentRun
+as it creates them. Every stage's harness fetches the same Task
+and resolves the same application.
+
+**Lifecycle management.** Hub watches AgentRun CRs (via
+controller-runtime client) the same way it watches addon pods.
+When an AgentRun reaches a terminal phase (Succeeded or Failed),
+Hub updates the corresponding Task row. When an AgentRun is
+deleted, Hub cleans up the Task row.
+
+**Runtime data service.** The harness calls Hub's existing REST
+API at runtime using the scoped token to fetch application
+metadata and decrypt credentials — the same endpoints addons use
+today (`GET /applications/{id}`,
+`GET /identities/{id}?decrypted=1`). No new Hub API capability
+is required.
+
+**ACP WebSocket proxy.** Hub proxies WebSocket connections from
+the UI to agent pods for real-time ACP streaming:
+
+1. UI polls `GET /hub/agentruns/:name` until `phase: Running`
+2. UI requests WebSocket upgrade via
+   `GET /hub/agentruns/:name/stream`
+3. Hub resolves the Sandbox Service DNS from AgentRun status
+4. Hub proxies the WebSocket with `X-Secret-Key` authentication
+5. UI receives ACP events (streaming text, tool calls, permission
+   requests) and sends responses (approvals, cancellation)
+
+##### Managed vs. standalone agents
+
+The same agent image and harness support two modes. Platform
+admins create separate Agent CRs for each mode.
+
+**Konveyor-managed Agent** (`konveyor.io/managed=true`):
+
+```yaml
+apiVersion: konveyor.io/v1alpha1
+kind: Agent
+metadata:
+  name: java-migration-agent
+  labels:
+    konveyor.io/managed: "true"
+spec:
+  image: quay.io/konveyor/agent-java-goose:latest
+  prompt: "You are a Java migration specialist..."
+  providers:
+    - ref: anthropic-provider
+  skillCollections:
+    - ref: java-migration-skills
+  params:
+    - name: target_framework
+      type: string
+      description: Target framework to migrate to
+      default: quarkus-3
+```
+
+No `source_url`, `branch`, or `target_branch` params. Hub provides
+application data through the Task row. The UI only renders form
+fields for params the user actually decides (here, just
+`target_framework`).
+
+**Standalone Agent** (no managed label):
+
+```yaml
+apiVersion: konveyor.io/v1alpha1
+kind: Agent
+metadata:
+  name: java-migration-agent-standalone
+spec:
+  image: quay.io/konveyor/agent-java-goose:latest
+  prompt: "You are a Java migration specialist..."
+  providers:
+    - ref: anthropic-provider
+  skillCollections:
+    - ref: java-migration-skills
+  params:
+    - name: source_url
+      type: string
+      required: true
+    - name: branch
+      type: string
+      default: main
+    - name: target_branch
+      type: string
+      required: true
+    - name: target_framework
+      type: string
+      default: quarkus-3
+```
+
+Same image, same prompt, same skills. The caller supplies git
+coordinates directly as params and credentials via `envFrom`.
+
+##### Harness behavior
+
+The harness (`/usr/local/bin/konveyor-harness`) in the base image
+determines its mode from the environment:
+
+**Managed mode** (`TASK` + `HUB_BASE_URL` present):
+1. Reads `TASK` env var (Task ID from Hub's database)
+2. Calls `GET /tasks/<id>` using `HUB_BASE_URL` and `TOKEN` —
+   discovers the application reference (same as addon startup)
+3. Calls `GET /applications/<id>` — gets git URL, branch
+4. Calls `GET /identities/<id>?decrypted=1` — gets credentials
+5. Clones the repo, configures workspace so the agent cannot push
+   (credentials stay in the harness, not in env or git config)
+6. Launches the agent runtime
+
+**Standalone mode** (`TASK` not present):
+1. Reads `KONVEYOR_PARAM_SOURCE_URL`, `KONVEYOR_PARAM_BRANCH`,
+   `KONVEYOR_PARAM_TARGET_BRANCH` from env
+2. Reads git credentials from mounted Secrets (via `envFrom`)
+3. Clones the repo, configures workspace
+4. Launches the agent runtime
+
+In both modes, the harness commits work incrementally and pushes
+to the target branch on exit.
+
+##### Credential security
+
+Git credentials never appear on the AgentRun CR. In managed mode,
+the harness fetches them from Hub at runtime via the scoped token
+and holds them internally — they are not exposed to the agent
+process via env vars or git config. This is strictly better than
+the earlier approach where credential Secret names were visible in
+the CR's `envFrom`.
+
+The scoped Hub token is on the CR (via `envFrom`), but it carries
+limited read-oriented scopes (`AddonScopes`). When OpenShell is
+layered on, its network policy can restrict Hub access to the
+harness binary only — the agent process would be denied.
+
+##### Networking
+
+Sandbox pods in managed mode need egress to Hub's in-cluster
+Service DNS. Two layers provide this:
+
+- **Agent Sandbox**: The `SandboxTemplate` `networkPolicy` field
+  allowlists egress to Hub's namespace and port. The default
+  managed policy blocks RFC1918 egress, so this is required.
+- **OpenShell** (if deployed): A declarative policy entry
+  allowlists `hub.konveyor.svc.cluster.local` for the harness
+  binary. Exact hostnames resolve to private IPs without needing
+  `allowed_ips` overrides.
+
+Standalone mode does not require Hub connectivity.
+
+##### UI interaction
+
+The UI renders the AgentRun create form dynamically from the
+Agent's param declarations. For managed agents, the form shows
+only user-decided params (e.g. `target_framework`) plus an
+application picker and model selector. The UI does not resolve
+git URLs or credentials — Hub and the harness handle that.
+
+##### Controller impact
+
+None. The controller's existing `spec.env` and `spec.envFrom`
+passthrough (lines 509, 381 of `agentrun_controller.go`) already
+handles Hub connectivity injection. Whatever Hub puts on the CR
+flows through to the Sandbox container unchanged. The controller
+does not know about Hub, Tasks, or applications.
 
 ### Security, Risks, and Mitigations
 
@@ -856,7 +1072,7 @@ from each agent pod. This architecturally enables human-in-the-loop
 interaction from the IDE or web UI — the UI connects to the pod's
 ACP endpoint via Hub proxy. When adding non-Goose runtimes, the
 harness bridges stdio ACP to the same HTTP endpoint. See
-[ADR 0002](docs/adr/0002-acp-transport-and-observability.md).
+[ADR 0002](https://github.com/konveyor/agentic-controller/blob/main/docs/adr/0002-acp-transport-and-observability.md).
 
 ### Test Plan
 
