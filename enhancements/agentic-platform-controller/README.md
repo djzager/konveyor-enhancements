@@ -739,7 +739,7 @@ Hub / UI                   Controller               Harness / Runtime
 Konveyor UI ──┐                                   ┌── Konveyor harness
               ├──► AgentRun CR ──► Sandbox ──►─────┤   (Hub client, git)
 Hub (CRUD +   │                                    │
- Task + token)┘                                    └── Custom harness
+ token)───────┘                                    └── Custom harness
                                                        (other platforms)
 CLI / GitOps ─────► AgentRun CR ──► Sandbox ──►──── Standalone harness
                                                     (no Hub needed)
@@ -752,8 +752,7 @@ different use case.
 ##### Hub's responsibilities
 
 **CRUD for agent CRDs.** Hub exposes REST endpoints for agent
-resources (Agent, SkillCard, SkillCollection, LLMProvider,
-AgentRun, AgentPlaybook, AgentPlaybookRun) using its
+resources under the `/hub/agent/` namespace using its
 controller-runtime client — the same pattern as `AddonHandler`
 and `ConfigMapHandler`. CRDs in etcd are the sole source of
 truth; Hub does not store copies in its database. All reads are
@@ -761,44 +760,55 @@ request-driven (`client.List()`, `client.Get()`) with no informer
 cache — the number of agent resources is small (tens, not
 thousands).
 
+| Hub Endpoint | CRD | Operations |
+|---|---|---|
+| `/hub/agent/agents` | Agent | List, Get, Create, Update, Delete |
+| `/hub/agent/skills` | SkillCard | List, Get, Create, Update, Delete |
+| `/hub/agent/skillcollections` | SkillCollection | List, Get, Create, Update, Delete |
+| `/hub/agent/providers` | LLMProvider | List, Get, Create, Update, Delete |
+| `/hub/agent/runs` | AgentRun | List, Get, Create, Cancel |
+| `/hub/agent/playbooks` | AgentPlaybook | List, Get, Create, Update, Delete |
+| `/hub/agent/playbookruns` | AgentPlaybookRun | List, Get, Create, Cancel |
+
 When listing Agents and AgentPlaybooks for the UI, Hub filters by
 `konveyor.io/managed=true`. All other resource types (SkillCards,
 SkillCollections, LLMProviders, AgentRuns, AgentPlaybookRuns) are
 listed unfiltered. Resources without the managed label remain
 usable via kubectl and other consumers.
 
-**Task row at AgentRun create time.** When Hub receives a create
-request for an AgentRun (or AgentPlaybookRun), it follows the
-same pattern as addon task creation:
+**AgentRun creation.** When Hub receives a create request for an
+AgentRun (or AgentPlaybookRun), it:
 
-1. Creates a lightweight Task row in its database containing the
-   application reference and run metadata — the same mechanism
-   that addon tasks use
-2. Mints a scoped API token via `auth.IdP.TaskGrant()` with
-   `AddonScopes` (including `applications:get`,
-   `identities:decrypt`) — the same scopes addons receive
-3. Stores the token in a Kubernetes Secret
-4. Adds `TASK`, `HUB_BASE_URL`, and the token Secret to the
+1. Mints a scoped API token with `AddonScopes` (including
+   `applications:get`, `identities:decrypt`) — the same scopes
+   addons receive. The token has a long TTL; the harness
+   self-revokes on exit (see below).
+2. Stores the token in a Kubernetes Secret
+3. Adds `HUB_URL`, `HUB_APP_ID`, and the token Secret to the
    AgentRun's `spec.env` and `spec.envFrom`
-5. Creates the AgentRun CR via `client.Create()`
+4. Creates the AgentRun CR via `client.Create()`
 
 Hub does **not** resolve application metadata, git URLs, branches,
-or credentials at create time. This is the key difference from the
-earlier smart-endpoint approach and is consistent with how addon
-tasks work — the thing-in-the-pod resolves what it needs at
-runtime.
+or credentials at create time. The harness resolves what it needs
+from Hub at runtime. Hub is fire-and-forget — it creates the CR
+and moves on.
 
-For AgentPlaybookRuns, Hub creates one Task row for the playbook
-run. The controller propagates the `TASK`, `HUB_BASE_URL`, and
-token env vars from the AgentPlaybookRun to each child AgentRun
-as it creates them. Every stage's harness fetches the same Task
-and resolves the same application.
+For AgentPlaybookRuns, the controller propagates env vars from the
+AgentPlaybookRun to each child AgentRun. Every stage's harness
+resolves the same application.
 
-**Lifecycle management.** Hub watches AgentRun CRs (via
-controller-runtime client) the same way it watches addon pods.
-When an AgentRun reaches a terminal phase (Succeeded or Failed),
-Hub updates the corresponding Task row. When an AgentRun is
-deleted, Hub cleans up the Task row.
+**Cancellation.** The UI cancels runs (never deletes them). Hub's
+cancel handler:
+
+1. Revokes the Hub API token (prevents further Hub API calls)
+2. Sets `spec.cancel: true` on the AgentRun CR
+3. The controller sees `spec.cancel`, deletes the Sandbox, and
+   sets the phase to `Cancelled`
+
+**Request-driven reads.** Hub does not watch or cache AgentRun
+status. When the UI requests an AgentRun, Hub calls
+`client.Get()` and returns the current state. All reads are
+on-demand — consistent with the fire-and-forget create model.
 
 **Runtime data service.** The harness calls Hub's existing REST
 API at runtime using the scoped token to fetch application
@@ -810,13 +820,19 @@ is required.
 **ACP WebSocket proxy.** Hub proxies WebSocket connections from
 the UI to agent pods for real-time ACP streaming:
 
-1. UI polls `GET /hub/agentruns/:name` until `phase: Running`
+1. UI polls `GET /hub/agent/runs/:name` until `phase: Running`
 2. UI requests WebSocket upgrade via
-   `GET /hub/agentruns/:name/stream`
+   `GET /hub/agent/runs/:name/acp`
 3. Hub resolves the Sandbox Service DNS from AgentRun status
-4. Hub proxies the WebSocket with `X-Secret-Key` authentication
-5. UI receives ACP events (streaming text, tool calls, permission
+4. Hub reads the ACP secret key from the Secret referenced by
+   `status.secretKeyRef` and injects the `X-Secret-Key` header
+5. Hub upgrades to WebSocket and proxies frames bidirectionally
+6. UI receives ACP events (streaming text, tool calls, permission
    requests) and sends responses (approvals, cancellation)
+
+The ACP secret key is generated by the controller (separate from
+the Hub API token) and stored in a Kubernetes Secret. Hub reads
+it to proxy; the UI never sees it directly.
 
 ##### Managed vs. standalone agents
 
@@ -847,9 +863,10 @@ spec:
 ```
 
 No `source_url`, `branch`, or `target_branch` params. Hub provides
-application data through the Task row. The UI only renders form
-fields for params the user actually decides (here, just
-`target_framework`).
+the application ID via env var; the harness resolves git
+coordinates and credentials from Hub at runtime. The UI only
+renders form fields for params the user actually decides (here,
+just `target_framework`).
 
 **Standalone Agent** (no managed label):
 
@@ -886,19 +903,20 @@ coordinates directly as params and credentials via `envFrom`.
 ##### Harness behavior
 
 The harness (`/usr/local/bin/konveyor-harness`) in the base image
-determines its mode from the environment:
+acts as a Hub client in managed mode — the same role that the
+addon adapter (`shared/addon/adapter`) plays for addons today.
 
-**Managed mode** (`TASK` + `HUB_BASE_URL` present):
-1. Reads `TASK` env var (Task ID from Hub's database)
-2. Calls `GET /tasks/<id>` using `HUB_BASE_URL` and `TOKEN` —
-   discovers the application reference (same as addon startup)
-3. Calls `GET /applications/<id>` — gets git URL, branch
-4. Calls `GET /identities/<id>?decrypted=1` — gets credentials
-5. Clones the repo, configures workspace so the agent cannot push
+**Managed mode** (`HUB_URL` + `HUB_APP_ID` present):
+1. Reads `HUB_APP_ID` and `HUB_URL` from env
+2. Calls `GET /applications/<id>` — gets git URL, branch
+3. Calls `GET /identities/<id>?decrypted=1` — gets credentials
+4. Clones the repo, configures workspace so the agent cannot push
    (credentials stay in the harness, not in env or git config)
-6. Launches the agent runtime
+5. Launches the agent runtime
+6. On exit (success or failure): revokes the Hub API token, then
+   exits
 
-**Standalone mode** (`TASK` not present):
+**Standalone mode** (`HUB_URL` not present):
 1. Reads `KONVEYOR_PARAM_SOURCE_URL`, `KONVEYOR_PARAM_BRANCH`,
    `KONVEYOR_PARAM_TARGET_BRANCH` from env
 2. Reads git credentials from mounted Secrets (via `envFrom`)
@@ -907,6 +925,18 @@ determines its mode from the environment:
 
 In both modes, the harness commits work incrementally and pushes
 to the target branch on exit.
+
+##### Token lifecycle
+
+The Hub API token has three revocation paths:
+
+- **Normal completion**: the harness revokes its own token as its
+  last act before exiting (success or failure)
+- **Cancellation**: Hub revokes the token in the cancel REST
+  handler before setting `spec.cancel` on the CR
+- **Crash / OOM-kill**: the harness cannot revoke. The token
+  expires naturally via its TTL. Start with a long TTL (e.g. 24h);
+  tighten later if needed.
 
 ##### Credential security
 
@@ -917,10 +947,19 @@ process via env vars or git config. This is strictly better than
 the earlier approach where credential Secret names were visible in
 the CR's `envFrom`.
 
-The scoped Hub token is on the CR (via `envFrom`), but it carries
-limited read-oriented scopes (`AddonScopes`). When OpenShell is
-layered on, its network policy can restrict Hub access to the
-harness binary only — the agent process would be denied.
+The Hub API token and the ACP secret key are separate credentials
+with separate trust boundaries:
+
+| | Hub API Token | ACP Secret Key |
+|---|---|---|
+| Created by | Hub | Controller |
+| Purpose | Harness → Hub API calls | UI → Hub → pod ACP proxy |
+| Stored in | Secret on CR's envFrom | Secret via status.secretKeyRef |
+| Revoked | By harness on exit, by Hub on cancel | N/A — destroyed with pod |
+
+When OpenShell is layered on, its network policy can restrict Hub
+access to the harness binary only — the agent process would be
+denied.
 
 ##### Networking
 
@@ -945,13 +984,38 @@ only user-decided params (e.g. `target_framework`) plus an
 application picker and model selector. The UI does not resolve
 git URLs or credentials — Hub and the harness handle that.
 
+##### Run pruning
+
+The controller prunes completed AgentRuns and AgentPlaybookRuns
+based on a configurable TTL (`ttlSecondsAfterFinished`), following
+the same pattern as Kubernetes Jobs. When the controller deletes
+an AgentRun, owner references cascade-delete the Sandbox and
+associated Secrets (ACP key, etc.) automatically.
+
+##### Scaling protection
+
+To prevent cluster resource exhaustion from unbounded concurrent
+runs:
+
+- **Kubernetes `ResourceQuota`**: Standard per-namespace resource
+  limits. This is the primary hard protection — prevents any
+  namespace from consuming unbounded compute.
+- **Controller `maxConcurrentRuns`**: A configurable limit on
+  concurrent AgentRuns. Runs beyond the limit remain in `Pending`
+  phase until a slot opens. This provides a better UX than
+  ResourceQuota rejection — runs queue rather than fail.
+
 ##### Controller impact
 
-None. The controller's existing `spec.env` and `spec.envFrom`
-passthrough (lines 509, 381 of `agentrun_controller.go`) already
-handles Hub connectivity injection. Whatever Hub puts on the CR
-flows through to the Sandbox container unchanged. The controller
-does not know about Hub, Tasks, or applications.
+Minimal. The controller's existing `spec.env` and `spec.envFrom`
+passthrough already handles Hub connectivity injection. Whatever
+Hub puts on the CR flows through to the Sandbox container
+unchanged. The controller does not know about Hub or applications.
+
+New controller concerns:
+- `spec.cancel` field: delete the Sandbox, set phase to `Cancelled`
+- `ttlSecondsAfterFinished`: prune completed runs after TTL
+- `maxConcurrentRuns`: hold excess runs in `Pending`
 
 ### Security, Risks, and Mitigations
 
