@@ -77,10 +77,15 @@ pattern: an Agent declares what is available and what inputs it needs;
 an AgentRun supplies concrete values and triggers execution.
 
 The controller is domain-agnostic. It does not call Hub, Backstage, or
-any inventory system. The creator of the AgentRun (UI, CLI, Backstage
-plugin, CI pipeline) resolves application metadata and supplies it as
-parameter values and env/envFrom on the AgentRun. The controller passes
-these through without interpretation.
+any inventory system. Parameters are opaque key-value pairs — the
+controller passes them through without interpretation. For
+Konveyor-managed agents, Hub injects its connectivity info (`HUB_BASE_URL`,
+`HUB_APP_ID`, scoped API token) into the AgentRun at create time, and
+the harness resolves application metadata from Hub at runtime —
+following the established addon pattern. For non-Konveyor use cases
+(CLI, GitOps), the caller supplies all values directly. The controller
+exposes interfaces and validation logic as importable Go packages so
+Hub can reuse them.
 
 Skills are sourced from OCI registries, git repositories, or inline
 content and resolved to OCI artifacts by the SkillCard controller.
@@ -103,8 +108,13 @@ enhancement.
 
 The Konveyor POC for AI-powered migration (tackle2-addon-kai) uses Hub's
 addon framework to launch agent containers. This couples agent execution
-to Hub's task lifecycle, requires Hub API changes for every new resource
-type, and makes the agent platform dependent on Hub.
+to Hub's task lifecycle and pod scheduling, requires Hub API changes for
+every new resource type, and makes the agent platform dependent on Hub
+for orchestration. The new architecture decouples orchestration
+(controller manages CRDs and Sandbox pods) from data resolution
+(harness calls Hub at runtime), while preserving the proven addon
+runtime pattern where the thing-in-the-pod resolves what it needs from
+Hub via a scoped API token.
 
 The POC also uses pallet to sync skills from git repos at container
 startup, adding network dependency and startup latency. Skills are not
@@ -148,8 +158,9 @@ output is a git branch pushed before pod termination. Session context
 3. **Skill authoring tools**: Domain of the skillimage project.
 
 4. **Hub or inventory integration in the controller**: The controller
-   does not call any external API. The UI resolves application metadata
-   before creating the AgentRun.
+   does not call any external API. For Konveyor-managed agents, the
+   harness resolves application metadata from Hub at runtime using a
+   scoped API token — following the established addon pattern.
 
 5. **Interactive / human-in-the-loop execution**: ACP-based interactive
    sessions are a future enhancement.
@@ -222,8 +233,13 @@ This follows the Tekton Task/TaskRun pattern.
   through to the Sandbox as raw Kubernetes primitives
 
 The controller injects params as `KONVEYOR_PARAM_{NAME}` env vars.
-It does not interpret their values. Git URLs, Hub tokens, MCP
-server addresses — all just parameter values to the controller.
+It does not interpret their values. For Konveyor-managed agents,
+Hub adds `HUB_BASE_URL`, `HUB_APP_ID`, and a scoped API token to the
+AgentRun's env/envFrom at create time, and the harness uses those
+to call Hub at runtime for application metadata and credential
+resolution. For non-Konveyor use cases, the caller supplies git
+URLs, MCP server addresses, and credentials directly as params or
+envFrom.
 
 ### Workspace Model: Git-as-Persistence
 
@@ -443,17 +459,16 @@ spec:
   instructions: |
     Migrate this application from Java EE 7 to Quarkus 3.x.
 
+  # For Konveyor-managed agents, Hub injects these at create time:
   env:
     - name: HUB_BASE_URL
       value: https://hub.konveyor.svc
-    - name: APP_ID
+    - name: HUB_APP_ID
       value: "123"
 
   envFrom:
     - secretRef:
-        name: hub-agent-token
-    - secretRef:
-        name: git-write-creds
+        name: agentrun-migrate-app-123-token  # Hub-minted scoped token
 
 status:
   phase: Running
@@ -523,16 +538,11 @@ spec:
       model: claude-sonnet-4-20250514
 
   params:
-    - name: source_url
-      value: https://github.com/acme/legacy-app.git
     - name: target_branch
       value: konveyor/migrate-app-123-full
 
-  envFrom:
-    - secretRef:
-        name: hub-agent-token
-    - secretRef:
-        name: git-write-creds
+  # Hub injects HUB_BASE_URL, HUB_APP_ID, and scoped token at create time;
+  # harness resolves git coordinates and credentials from Hub at runtime
 
 status:
   currentStage: implement
@@ -618,10 +628,17 @@ kubectl get llmproviders
 #### Story 2: Developer runs a migration via the UI
 
 1. User selects application from Hub inventory
-2. UI resolves git URLs + credential Secret names from Hub
-3. UI creates AgentRun CR via Hub's passthrough proxy to the k8s API
-4. UI watches AgentRun status via the same passthrough
-5. On completion: shows branch link
+2. User selects an Agent and model, provides instructions
+3. UI sends create request to Hub (`POST /hub/agent/runs`) with
+   agent ref, application ref, models, and instructions
+4. Hub mints a scoped API token, adds `HUB_BASE_URL`, `HUB_APP_ID`,
+   and the token to the AgentRun env/envFrom, creates the CR
+5. Controller creates Sandbox pod
+6. Harness calls Hub at runtime to resolve git URL, branch, and
+   decrypted credentials from the application record
+7. Harness clones repo, launches agent
+8. UI polls AgentRun status; connects via ACP WebSocket for streaming
+9. On completion: shows branch link
 
 #### Story 3: CLI user runs an agent against any repo
 
@@ -784,7 +801,7 @@ AgentRun (or AgentPlaybookRun), it:
    addons receive. The token has a long TTL; the harness
    self-revokes on exit (see below).
 2. Stores the token in a Kubernetes Secret
-3. Adds `HUB_URL`, `HUB_APP_ID`, and the token Secret to the
+3. Adds `HUB_BASE_URL`, `HUB_APP_ID`, and the token Secret to the
    AgentRun's `spec.env` and `spec.envFrom`
 4. Creates the AgentRun CR via `client.Create()`
 
@@ -906,8 +923,8 @@ The harness (`/usr/local/bin/konveyor-harness`) in the base image
 acts as a Hub client in managed mode — the same role that the
 addon adapter (`shared/addon/adapter`) plays for addons today.
 
-**Managed mode** (`HUB_URL` + `HUB_APP_ID` present):
-1. Reads `HUB_APP_ID` and `HUB_URL` from env
+**Managed mode** (`HUB_BASE_URL` + `HUB_APP_ID` present):
+1. Reads `HUB_APP_ID` and `HUB_BASE_URL` from env
 2. Calls `GET /applications/<id>` — gets git URL, branch
 3. Calls `GET /identities/<id>?decrypted=1` — gets credentials
 4. Clones the repo, configures workspace so the agent cannot push
@@ -916,7 +933,7 @@ addon adapter (`shared/addon/adapter`) plays for addons today.
 6. On exit (success or failure): revokes the Hub API token, then
    exits
 
-**Standalone mode** (`HUB_URL` not present):
+**Standalone mode** (`HUB_BASE_URL` not present):
 1. Reads `KONVEYOR_PARAM_SOURCE_URL`, `KONVEYOR_PARAM_BRANCH`,
    `KONVEYOR_PARAM_TARGET_BRANCH` from env
 2. Reads git credentials from mounted Secrets (via `envFrom`)
@@ -987,8 +1004,16 @@ git URLs or credentials — Hub and the harness handle that.
 ##### Run pruning
 
 The controller prunes completed AgentRuns and AgentPlaybookRuns
-based on a configurable TTL (`ttlSecondsAfterFinished`), following
-the same pattern as Kubernetes Jobs. When the controller deletes
+based on configurable TTLs per terminal condition, following
+the same pattern as Kubernetes Jobs:
+
+- `ttlSecondsAfterSucceeded` — TTL for runs that succeeded
+- `ttlSecondsAfterFailed` — TTL for runs that failed
+- `ttlSecondsAfterCancelled` — TTL for runs that were cancelled
+
+Per-condition TTLs allow different retention policies — for
+example, keeping failed runs longer for debugging while
+aggressively pruning successful runs. When the controller deletes
 an AgentRun, owner references cascade-delete the Sandbox and
 associated Secrets (ACP key, etc.) automatically.
 
@@ -1014,8 +1039,22 @@ unchanged. The controller does not know about Hub or applications.
 
 New controller concerns:
 - `spec.cancel` field: delete the Sandbox, set phase to `Cancelled`
-- `ttlSecondsAfterFinished`: prune completed runs after TTL
+- Per-condition TTL pruning: prune completed runs after TTL
 - `maxConcurrentRuns`: hold excess runs in `Pending`
+
+##### Reusable interfaces
+
+The controller exposes its orchestration logic as importable Go
+packages — not just CRD types, but the interfaces and functions
+for param validation, model selection, skill resolution, and
+Sandbox construction. Hub imports these alongside the CRD types.
+
+This enables a future where the Hub tasking system could run
+agents and agent playbooks directly — using the controller's Go
+packages for orchestration without creating CRs. In that model,
+Hub would use the same interfaces to validate, resolve, and build
+Sandboxes, tightly controlling the dependency on the agentic
+controller as a library rather than a running controller.
 
 ### Security, Risks, and Mitigations
 
@@ -1086,10 +1125,11 @@ Five CRDs, five controllers. SkillCards OCI refs only.
 | Agent | Agent controller | POC |
 | AgentRun | AgentRun controller | POC |
 
-**UI access:** Via Hub's service passthrough proxy to the k8s API,
-scoped to `konveyor.io` API group only. The UI resolves application
-metadata from Hub and creates the AgentRun CR with all values
-filled in. The controller passes them through.
+**UI access:** Via Hub's CRUD endpoints under `/hub/agent/`. Hub
+mints a scoped API token at AgentRun create time, injects Hub
+connectivity info (`HUB_BASE_URL`, `HUB_APP_ID`, token), and creates
+the CR. The harness resolves application metadata from Hub at
+runtime — following the established addon pattern.
 
 #### Phase 2: AgentPlaybook (flat stages)
 
@@ -1101,27 +1141,10 @@ filled in. The controller passes them through.
 All stages share a target branch. Cross-stage handoff via
 committed `.konveyor/handoff.md`.
 
-#### Phase 3: SkillCard sources + curated Hub API
+#### Phase 3: SkillCard sources
 
 **SkillCard resolution:** Git source and inline content resolution.
 In-cluster registry integration (Zot or OpenShift built-in).
-
-**Curated Hub API:** Replace the k8s API passthrough with
-purpose-built Hub REST endpoints for agent resources. Hub reads
-CRs from the cluster using its controller-runtime client and
-exposes them in Hub's REST format. Benefits over passthrough:
-
-- Hub controls the API contract (no raw k8s response format)
-- Hub can join agent data with application data (SQL + k8s)
-- Hub validates inputs with business logic before creating CRs
-- Hub returns Hub-style errors, not k8s Status objects
-- Reduced privilege escalation surface (Hub exposes only what it chooses)
-- For AgentRun creation, Hub resolves app metadata and fills
-  params before creating the CR — the UI sends a simple request
-
-Hub endpoints follow the existing handler pattern (~150 lines
-per resource). Four handlers for POC resources (Agent, SkillCard,
-LLMProvider, AgentRun), expanding as CRDs are added.
 
 #### Phase 4: Agent memory
 
@@ -1174,6 +1197,11 @@ expected. Conversion webhooks for `v1beta1`.
 - **2026-06-22**: Revised: Tekton-style param model, controller
   decoupled from Hub, env/envFrom passthrough, skill mounting
   simplified to single /opt/skills/ directory
+- **2026-07-23**: Revised: Hub integration follows established addon
+  pattern — Hub injects HUB_BASE_URL, HUB_APP_ID, and scoped token
+  directly on the CR (no Task envelope). Harness resolves from Hub
+  at runtime. Added cancel semantics, token lifecycle, run pruning,
+  scaling protection, reusable controller interfaces.
 
 ## Drawbacks
 
@@ -1191,10 +1219,11 @@ expected. Conversion webhooks for `v1beta1`.
 5. **Git remote as sole persistence**: Work in progress lost on pod
    crash if harness hasn't pushed. Mitigated by incremental push.
 
-6. **UI does more work (POC)**: The UI resolves application metadata
-   from Hub before creating the AgentRun. The controller doesn't
-   help with this. In Phase 3, curated Hub endpoints take over
-   this resolution, simplifying the UI.
+6. **Harness requires Hub connectivity**: For Konveyor-managed
+   agents, Sandbox pods need egress to Hub's in-cluster Service
+   DNS. This requires network policy configuration on the
+   SandboxTemplate. Non-Konveyor use cases (where the caller
+   supplies all values directly) do not need Hub connectivity.
 
 ## Landscape
 
@@ -1361,10 +1390,35 @@ avoid blocking on external alignment.
 The controller resolves application metadata from Hub via an
 internal adapter. The AgentRun carries an application ID.
 
-**Rejected**: Couples the controller to Hub's API. The Tekton model
-is better — the AgentRun carries resolved values, the controller
-passes them through. The UI resolves from Hub, Backstage, or
-wherever before creating the AgentRun.
+**Rejected**: Couples the controller to Hub's API. The controller
+stays domain-agnostic — it passes params through without
+interpretation. Application metadata resolution belongs in the
+harness (at runtime, following the addon pattern), not in the
+controller.
+
+### Smart Hub endpoint for AgentRun creation
+
+Hub eagerly resolves application metadata (git URLs, credentials)
+at AgentRun create time, building the full CR before creating it.
+
+**Rejected**: Breaks the established Hub addon pattern where Hub
+is a dumb store and the thing-in-the-pod resolves what it needs
+at runtime via a scoped API token. The harness calling Hub at
+runtime (like addons do today) is consistent with existing Hub
+conventions and requires no new Hub resolution logic.
+
+### Task envelope for application binding
+
+Hub creates a Task row in its database to carry the application
+reference, following the addon task model. The harness discovers
+the application by fetching the Task record from Hub.
+
+**Rejected**: The Task concept represents an addon execution
+request — it has an addon image, a pod, and a lifecycle that Hub
+manages. Agent runs have no addon and the controller (not Hub)
+creates the pod. Expanding the Task definition for this purpose
+is impractical. Hub injects the application ID directly on the
+CR via env vars instead.
 
 ### Custom `source` field on AgentRun
 
