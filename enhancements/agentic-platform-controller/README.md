@@ -179,8 +179,8 @@ output is a git branch pushed before pod termination. Session context
                     │          Kubernetes API Server               │
                     │                                             │
                     │  SkillCard    SkillCollection   LLMProvider │
-                    │  Agent       AgentPlaybook                  │
-                    │  AgentRun    AgentPlaybookRun               │
+                    │  Agent       AgentWorkflow                  │
+                    │  AgentRun    AgentWorkflowRun               │
                     └──────────────┬──────────────────────────────┘
                                    │
                     ┌──────────────▼──────────────────────────────┐
@@ -191,7 +191,7 @@ output is a git branch pushed before pod termination. Session context
                     │  LLMProvider controller  (verification)     │
                     │  Agent controller        (budget, readiness)│
                     │  AgentRun controller     (validate, Sandbox)│
-                    │  AgentPlaybookRun ctrl   (sequential runs)  │
+                    │  AgentWorkflowRun ctrl  (sequential runs)  │
                     └──────────────┬──────────────────────────────┘
                                    │
                     ┌──────────────▼──────────────────────────────┐
@@ -270,7 +270,7 @@ This reduces accidental exposure but does not provide full isolation.
 Full credential isolation requires OpenShell filesystem policy
 enforcement (future).
 
-**Cross-stage continuity** in AgentPlaybooks: all stages share the
+**Cross-stage continuity** in AgentWorkflows: all stages share the
 same target branch. Each stage reads the previous stage's committed
 `.konveyor/handoff.md`.
 
@@ -493,14 +493,14 @@ status:
 The controller makes **no external API calls**. It reads CRs from
 the Kubernetes API and creates Sandboxes. That's it.
 
-#### AgentPlaybook
+#### AgentWorkflow
 
 An ordered sequence of stages. Each stage references an Agent and
 carries instructions.
 
 ```yaml
 apiVersion: konveyor.io/v1alpha1
-kind: AgentPlaybook
+kind: AgentWorkflow
 metadata:
   name: java-migration
 spec:
@@ -519,18 +519,18 @@ spec:
       instructions: Review all changes. Run build and tests.
 ```
 
-#### AgentPlaybookRun
+#### AgentWorkflowRun
 
-Execute a playbook. The controller creates AgentRuns sequentially,
+Execute a workflow. The controller creates AgentRuns sequentially,
 all sharing the same target branch.
 
 ```yaml
 apiVersion: konveyor.io/v1alpha1
-kind: AgentPlaybookRun
+kind: AgentWorkflowRun
 metadata:
   name: migrate-app-123-full
 spec:
-  playbookRef: java-migration
+  workflowRef: java-migration
 
   models:
     - role: primary
@@ -679,9 +679,9 @@ konveyor/agentic-controller/
     skillcollection_types.go
     llmprovider_types.go
     agent_types.go
-    agentplaybook_types.go
+    agentworkflow_types.go
     agentrun_types.go
-    agentplaybookrun_types.go
+    agentworkflowrun_types.go
     groupversion_info.go
   internal/controller/
     skillcard_controller.go
@@ -689,7 +689,7 @@ konveyor/agentic-controller/
     llmprovider_controller.go
     agent_controller.go
     agentrun_controller.go
-    agentplaybookrun_controller.go
+    agentworkflowrun_controller.go
   internal/registry/
     client.go          # wraps skillimage pkg/oci
     detect.go          # auto-detect OpenShift registry
@@ -784,17 +784,17 @@ thousands).
 | `/hub/agent/skillcollections` | SkillCollection | List, Get, Create, Update, Delete |
 | `/hub/agent/providers` | LLMProvider | List, Get, Create, Update, Delete |
 | `/hub/agent/runs` | AgentRun | List, Get, Create, Cancel |
-| `/hub/agent/playbooks` | AgentPlaybook | List, Get, Create, Update, Delete |
-| `/hub/agent/playbookruns` | AgentPlaybookRun | List, Get, Create, Cancel |
+| `/hub/agent/workflows` | AgentWorkflow | List, Get, Create, Update, Delete |
+| `/hub/agent/workflowruns` | AgentWorkflowRun | List, Get, Create, Cancel |
 
-When listing Agents and AgentPlaybooks for the UI, Hub filters by
+When listing Agents and AgentWorkflows for the UI, Hub filters by
 `konveyor.io/managed=true`. All other resource types (SkillCards,
-SkillCollections, LLMProviders, AgentRuns, AgentPlaybookRuns) are
+SkillCollections, LLMProviders, AgentRuns, AgentWorkflowRuns) are
 listed unfiltered. Resources without the managed label remain
 usable via kubectl and other consumers.
 
 **AgentRun creation.** When Hub receives a create request for an
-AgentRun (or AgentPlaybookRun), it:
+AgentRun (or AgentWorkflowRun), it:
 
 1. Mints a scoped API token with `AddonScopes` (including
    `applications:get`, `identities:decrypt`) — the same scopes
@@ -810,8 +810,8 @@ or credentials at create time. The harness resolves what it needs
 from Hub at runtime. Hub is fire-and-forget — it creates the CR
 and moves on.
 
-For AgentPlaybookRuns, the controller propagates env vars from the
-AgentPlaybookRun to each child AgentRun. Every stage's harness
+For AgentWorkflowRuns, the controller propagates env vars from the
+AgentWorkflowRun to each child AgentRun. Every stage's harness
 resolves the same application.
 
 **Cancellation.** The UI cancels runs (never deletes them). Hub's
@@ -1003,7 +1003,7 @@ git URLs or credentials — Hub and the harness handle that.
 
 ##### Run pruning
 
-The controller prunes completed AgentRuns and AgentPlaybookRuns
+The controller prunes completed AgentRuns and AgentWorkflowRuns
 based on configurable TTLs per terminal condition, following
 the same pattern as Kubernetes Jobs:
 
@@ -1050,7 +1050,7 @@ for param validation, model selection, skill resolution, and
 Sandbox construction. Hub imports these alongside the CRD types.
 
 This enables a future where the Hub tasking system could run
-agents and agent playbooks directly — using the controller's Go
+agents and agent workflows directly — using the controller's Go
 packages for orchestration without creating CRs. In that model,
 Hub would use the same interfaces to validate, resolve, and build
 Sandboxes, tightly controlling the dependency on the agentic
@@ -1131,12 +1131,12 @@ connectivity info (`HUB_BASE_URL`, `HUB_APP_ID`, token), and creates
 the CR. The harness resolves application metadata from Hub at
 runtime — following the established addon pattern.
 
-#### Phase 2: AgentPlaybook (flat stages)
+#### Phase 2: AgentWorkflow (flat stages)
 
 | CRD | Controller | Scope |
 |---|---|---|
-| AgentPlaybook | AgentPlaybook controller | Phase 2 |
-| AgentPlaybookRun | AgentPlaybookRun controller | Phase 2 |
+| AgentWorkflow | AgentWorkflow controller | Phase 2 |
+| AgentWorkflowRun | AgentWorkflowRun controller | Phase 2 |
 
 All stages share a target branch. Cross-stage handoff via
 committed `.konveyor/handoff.md`.
@@ -1170,7 +1170,7 @@ harness bridges stdio ACP to the same HTTP endpoint. See
 - AgentRun controller: param validation, Sandbox creation, env
   injection, status tracking
 - LLMProvider controller: valid endpoint verification, invalid credentials handling, model discovery
-- AgentPlaybookRun controller: sequential stages, shared branch
+- AgentWorkflowRun controller: sequential stages, shared branch
 
 **Integration tests** (envtest):
 - Full lifecycle: LLMProvider + SkillCards + Agent + AgentRun
@@ -1180,7 +1180,7 @@ harness bridges stdio ACP to the same HTTP endpoint. See
 **E2E tests** (real cluster):
 - Deploy controller with Agent Sandbox, run an AgentRun
 - LLMProvider verification: valid/invalid credentials
-- AgentPlaybookRun: three stages, verify branch has all commits
+- AgentWorkflowRun: three stages, verify branch has all commits
 
 ### Upgrade / Downgrade Strategy
 
@@ -1193,7 +1193,7 @@ expected. Conversion webhooks for `v1beta1`.
 
 - **2026-06**: POC CRD definitions on dymurray/tackle2-ui agent branch
 - **2026-06-17**: Enhancement proposal drafted
-- **2026-06-18**: Revised: git-as-persistence, simplified playbook
+- **2026-06-18**: Revised: git-as-persistence, simplified workflow
 - **2026-06-22**: Revised: Tekton-style param model, controller
   decoupled from Hub, env/envFrom passthrough, skill mounting
   simplified to single /opt/skills/ directory
