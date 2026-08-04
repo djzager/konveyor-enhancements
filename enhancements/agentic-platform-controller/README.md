@@ -353,8 +353,13 @@ SkillCard CRs for git sources. Report aggregate readiness.
 #### Gateway
 
 A specific provider/model combination with endpoint and credentials.
-Each Gateway represents one model at one provider — to offer multiple
-models, create multiple Gateway CRs.
+Each Gateway declares a provider type, an endpoint, credentials, and
+one model. The provider type (e.g. `anthropic`, `openai`,
+`gcp-vertex-ai`) is injected as `KONVEYOR_LLM_PROVIDER` so the
+harness can map credentials to provider-specific env vars. This is
+a pre-OpenShell shim — when `inference.local` eliminates
+provider-specific credential mapping, the field is removed. To offer
+multiple models, create multiple Gateway CRs.
 
 ```yaml
 apiVersion: konveyor.io/v1alpha1
@@ -362,6 +367,7 @@ kind: Gateway
 metadata:
   name: anthropic-sonnet
 spec:
+  provider: anthropic
   endpoint: https://api.anthropic.com
   credentialRef:
     secretName: anthropic-credentials
@@ -478,7 +484,7 @@ status:
 
 1. Validate params match Agent's declarations
 2. Resolve skills → OCI image refs (from SkillCard status)
-3. Resolve gateway → credential Secret, set `KONVEYOR_LLM_ENDPOINT`, `KONVEYOR_LLM_MODEL`, `KONVEYOR_LLM_API_KEY`
+3. Resolve gateway → credential Secret, set `KONVEYOR_LLM_PROVIDER`, `KONVEYOR_LLM_ENDPOINT`, `KONVEYOR_LLM_MODEL`, `KONVEYOR_LLM_API_KEY`
 4. Inject params as `KONVEYOR_PARAM_*` env vars
 5. Pass through `env` and `envFrom` unchanged
 6. Create Sandbox (image + ImageVolumes for skills + env/envFrom + EmptyDir workspace). ImageVolumes are a Kubernetes PodSpec feature (K8s 1.33+) specified via `podTemplate.spec.volumes` on the Sandbox CR.
@@ -1196,7 +1202,12 @@ expected. Conversion webhooks for `v1beta1`.
   represents one provider/model combination (single `model:` field,
   not a `models:` list). Agent `providers` field renamed to
   `gateways`. AgentRun/AgentWorkflowRun `models` list replaced with
-  single `gateway` string field.
+  single `gateway` string field. Added `spec.provider` field to
+  Gateway — a pre-OpenShell shim carrying the runtime provider type
+  (e.g. `anthropic`, `openai`) injected as `KONVEYOR_LLM_PROVIDER`
+  so the harness can map credentials to provider-specific env vars.
+  Deletes cleanly when OpenShell `inference.local` eliminates
+  provider-specific credential mapping.
 
 ## Drawbacks
 
