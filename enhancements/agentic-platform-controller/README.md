@@ -26,10 +26,10 @@ A Kubernetes-native controller for managing AI agent workloads. Introduces
 seven CRDs under the `konveyor.io` API group and six controllers in a new
 `konveyor/agentic-controller` repository.
 
-Agents are templates that declare available skills, LLM providers, a
-container image, a prompt, and typed parameters. AgentRuns are invocations
-that supply concrete values — model selections, parameter values,
-instructions, and additional env/envFrom passed through to the Sandbox.
+Agents are templates that declare available skills, gateways (provider/model
+combinations), a container image, a prompt, and typed parameters. AgentRuns
+are invocations that supply concrete values — a gateway selection, parameter
+values, instructions, and additional env/envFrom passed through to the Sandbox.
 The controller validates, resolves skills to ImageVolumes, and creates
 Agent Sandbox workloads. It does not interpret parameter values or call
 any external API.
@@ -56,7 +56,7 @@ commits and pushes. Everything durable lives in git.
    by default. The controller hashes inline/git-sourced skill content
    and uses SHA-based OCI tags to avoid rebuilding unchanged skills.
 
-3. **LLMProvider verification frequency**: Resolved. Verification on
+3. **Gateway verification frequency**: Resolved. Verification on
    create/update only. Periodic health checks are deferred.
 
 4. **Agent Sandbox API stability**: Resolved. Agent Sandbox is a hard
@@ -140,7 +140,7 @@ output is a git branch pushed before pod termination. Session context
 4. **Skill lifecycle management**: Resolve skills from OCI, git, or
    inline to versioned OCI artifacts via skillimage.
 
-5. **LLM provider verification**: Validate that LLM endpoints are
+5. **Gateway verification**: Validate that LLM endpoints are
    reachable by launching the actual base image container.
 
 6. **Git-as-persistence**: Ephemeral workspaces, durable git branches.
@@ -178,7 +178,7 @@ output is a git branch pushed before pod termination. Session context
                     ┌─────────────────────────────────────────────┐
                     │          Kubernetes API Server               │
                     │                                             │
-                    │  SkillCard    SkillCollection   LLMProvider │
+                    │  SkillCard    SkillCollection   Gateway     │
                     │  Agent       AgentWorkflow                  │
                     │  AgentRun    AgentWorkflowRun               │
                     └──────────────┬──────────────────────────────┘
@@ -188,7 +188,7 @@ output is a git branch pushed before pod termination. Session context
                     │                                             │
                     │  SkillCard controller    (OCI/git/inline)   │
                     │  SkillCollection controller (child CRs)     │
-                    │  LLMProvider controller  (verification)     │
+                    │  Gateway controller     (verification)      │
                     │  Agent controller        (budget, readiness)│
                     │  AgentRun controller     (validate, Sandbox)│
                     │  AgentWorkflowRun ctrl  (sequential runs)  │
@@ -220,14 +220,14 @@ This follows the Tekton Task/TaskRun pattern.
 
 **Agent declares:**
 - `params` — typed parameters (name, type, description, default)
-- `providers` — available LLM providers and models
+- `gateways` — available gateways (provider/model combinations)
 - `skillCards`, `skillCollections` — available skills
 - `image` — container image with runtime and toolchains
 - `prompt` — standing instructions
 
 **AgentRun supplies:**
 - `params` — values for each declared parameter
-- `models` — specific provider/model selections
+- `gateway` — gateway selection for this run
 - `instructions` — task-specific instructions (composed with prompt)
 - `env`, `envFrom` — additional env vars and secret refs passed
   through to the Sandbox as raw Kubernetes primitives
@@ -350,31 +350,29 @@ status:
 **Controller behavior**: Watch referenced SkillCards. Create child
 SkillCard CRs for git sources. Report aggregate readiness.
 
-#### LLMProvider
+#### Gateway
 
-An LLM service endpoint with credentials and available models.
+A specific provider/model combination with endpoint and credentials.
+Each Gateway represents one model at one provider — to offer multiple
+models, create multiple Gateway CRs.
 
 ```yaml
 apiVersion: konveyor.io/v1alpha1
-kind: LLMProvider
+kind: Gateway
 metadata:
-  name: anthropic-provider
+  name: anthropic-sonnet
 spec:
   endpoint: https://api.anthropic.com
   credentialRef:
     secretName: anthropic-credentials
     key: api-key
-  models:
-    - name: claude-sonnet-4-20250514
-      contextWindow: 200000
-      tier: premium
-    - name: claude-haiku
-      contextWindow: 200000
-      tier: efficient
+  model:
+    name: claude-sonnet-4-20250514
+    contextWindow: 200000
+    tier: premium
 
 status:
   connectionVerified: true
-  discoveredModels: [claude-sonnet-4-20250514, claude-haiku]
   conditions:
     - type: Ready
       status: "True"
@@ -397,9 +395,9 @@ spec:
   prompt: |
     You are a Java migration specialist.
 
-  providers:
-    - ref: anthropic-provider
-    - ref: openai-provider
+  gateways:
+    - ref: anthropic-sonnet
+    - ref: openai-gpt4o
 
   skillCards:
     - ref: maven-migration
@@ -443,10 +441,7 @@ metadata:
 spec:
   agentRef: java-migration-agent
 
-  models:
-    - role: primary
-      provider: anthropic-provider
-      model: claude-sonnet-4-20250514
+  gateway: anthropic-sonnet
 
   params:
     - name: source_url
@@ -483,7 +478,7 @@ status:
 
 1. Validate params match Agent's declarations
 2. Resolve skills → OCI image refs (from SkillCard status)
-3. Resolve LLM providers → credential Secrets
+3. Resolve gateway → credential Secret, set `KONVEYOR_LLM_ENDPOINT`, `KONVEYOR_LLM_MODEL`, `KONVEYOR_LLM_API_KEY`
 4. Inject params as `KONVEYOR_PARAM_*` env vars
 5. Pass through `env` and `envFrom` unchanged
 6. Create Sandbox (image + ImageVolumes for skills + env/envFrom + EmptyDir workspace). ImageVolumes are a Kubernetes PodSpec feature (K8s 1.33+) specified via `podTemplate.spec.volumes` on the Sandbox CR.
@@ -532,10 +527,7 @@ metadata:
 spec:
   workflowRef: java-migration
 
-  models:
-    - role: primary
-      provider: anthropic-provider
-      model: claude-sonnet-4-20250514
+  gateway: anthropic-sonnet
 
   params:
     - name: target_branch
@@ -610,27 +602,27 @@ for the full design.
 
 ### User Stories
 
-#### Story 1: Platform admin configures skills and providers
+#### Story 1: Platform admin configures skills and gateways
 
 ```bash
 kubectl apply -f skills/maven-migration.yaml
-kubectl apply -f providers/anthropic.yaml
+kubectl apply -f gateways/anthropic-sonnet.yaml
 
 kubectl get skillcards
 # NAME              TYPE    READY
 # maven-migration   skill   True
 
-kubectl get llmproviders
-# NAME                 VERIFIED   MODELS
-# anthropic-provider   True       claude-sonnet-4-20250514, claude-haiku
+kubectl get gateways
+# NAME               MODEL                      VERIFIED
+# anthropic-sonnet   claude-sonnet-4-20250514   True
 ```
 
 #### Story 2: Developer runs a migration via the UI
 
 1. User selects application from Hub inventory
-2. User selects an Agent and model, provides instructions
+2. User selects an Agent and gateway, provides instructions
 3. UI sends create request to Hub (`POST /hub/agent/runs`) with
-   agent ref, application ref, models, and instructions
+   agent ref, application ref, gateway, and instructions
 4. Hub mints a scoped API token, adds `HUB_BASE_URL`, `HUB_APP_ID`,
    and the token to the AgentRun env/envFrom, creates the CR
 5. Controller creates Sandbox pod
@@ -650,10 +642,8 @@ metadata:
   name: review-infra-repo
 spec:
   agentRef: code-review-agent
-  models:
-    - role: primary
-      provider: anthropic-provider
-      model: claude-sonnet-4-20250514
+  gateway: anthropic-sonnet
+
   params:
     - name: source_url
       value: https://github.com/myorg/infra.git
@@ -677,7 +667,7 @@ konveyor/agentic-controller/
   api/v1alpha1/
     skillcard_types.go
     skillcollection_types.go
-    llmprovider_types.go
+    gateway_types.go
     agent_types.go
     agentworkflow_types.go
     agentrun_types.go
@@ -686,7 +676,7 @@ konveyor/agentic-controller/
   internal/controller/
     skillcard_controller.go
     skillcollection_controller.go
-    llmprovider_controller.go
+    gateway_controller.go
     agent_controller.go
     agentrun_controller.go
     agentworkflowrun_controller.go
@@ -782,14 +772,14 @@ thousands).
 | `/hub/agent/agents` | Agent | List, Get, Create, Update, Delete |
 | `/hub/agent/skills` | SkillCard | List, Get, Create, Update, Delete |
 | `/hub/agent/skillcollections` | SkillCollection | List, Get, Create, Update, Delete |
-| `/hub/agent/providers` | LLMProvider | List, Get, Create, Update, Delete |
+| `/hub/agent/gateways` | Gateway | List, Get, Create, Update, Delete |
 | `/hub/agent/runs` | AgentRun | List, Get, Create, Cancel |
 | `/hub/agent/workflows` | AgentWorkflow | List, Get, Create, Update, Delete |
 | `/hub/agent/workflowruns` | AgentWorkflowRun | List, Get, Create, Cancel |
 
 When listing Agents and AgentWorkflows for the UI, Hub filters by
 `konveyor.io/managed=true`. All other resource types (SkillCards,
-SkillCollections, LLMProviders, AgentRuns, AgentWorkflowRuns) are
+SkillCollections, Gateways, AgentRuns, AgentWorkflowRuns) are
 listed unfiltered. Resources without the managed label remain
 usable via kubectl and other consumers.
 
@@ -868,8 +858,8 @@ metadata:
 spec:
   image: quay.io/konveyor/agent-java-goose:latest
   prompt: "You are a Java migration specialist..."
-  providers:
-    - ref: anthropic-provider
+  gateways:
+    - ref: anthropic-sonnet
   skillCollections:
     - ref: java-migration-skills
   params:
@@ -895,8 +885,8 @@ metadata:
 spec:
   image: quay.io/konveyor/agent-java-goose:latest
   prompt: "You are a Java migration specialist..."
-  providers:
-    - ref: anthropic-provider
+  gateways:
+    - ref: anthropic-sonnet
   skillCollections:
     - ref: java-migration-skills
   params:
@@ -1121,7 +1111,7 @@ Five CRDs, five controllers. SkillCards OCI refs only.
 |---|---|---|
 | SkillCard | SkillCard controller | POC |
 | SkillCollection | SkillCollection controller | POC |
-| LLMProvider | LLMProvider controller | POC |
+| Gateway | Gateway controller | POC |
 | Agent | Agent controller | POC |
 | AgentRun | AgentRun controller | POC |
 
@@ -1169,17 +1159,17 @@ harness bridges stdio ACP to the same HTTP endpoint. See
 - Agent controller: param validation, context budget
 - AgentRun controller: param validation, Sandbox creation, env
   injection, status tracking
-- LLMProvider controller: valid endpoint verification, invalid credentials handling, model discovery
+- Gateway controller: valid endpoint verification, invalid credentials handling
 - AgentWorkflowRun controller: sequential stages, shared branch
 
 **Integration tests** (envtest):
-- Full lifecycle: LLMProvider + SkillCards + Agent + AgentRun
+- Full lifecycle: Gateway + SkillCards + Agent + AgentRun
 - Param validation: missing required param, wrong type
 - Error handling: non-existent Agent, unresolved skills
 
 **E2E tests** (real cluster):
 - Deploy controller with Agent Sandbox, run an AgentRun
-- LLMProvider verification: valid/invalid credentials
+- Gateway verification: valid/invalid credentials
 - AgentWorkflowRun: three stages, verify branch has all commits
 
 ### Upgrade / Downgrade Strategy
@@ -1202,6 +1192,11 @@ expected. Conversion webhooks for `v1beta1`.
   directly on the CR (no Task envelope). Harness resolves from Hub
   at runtime. Added cancel semantics, token lifecycle, run pruning,
   scaling protection, reusable controller interfaces.
+- **2026-08-04**: Renamed LLMProvider CRD to Gateway. Each Gateway
+  represents one provider/model combination (single `model:` field,
+  not a `models:` list). Agent `providers` field renamed to
+  `gateways`. AgentRun/AgentWorkflowRun `models` list replaced with
+  single `gateway` string field.
 
 ## Drawbacks
 
@@ -1320,12 +1315,14 @@ we could adopt their `agentic.openshift.io/v1alpha1` primitives
 and identified one area of strong alignment and four requirements
 that their current model does not satisfy.
 
-**What aligns: LLMProvider.** Their `LLMProvider` CRD is a
+**What aligns: LLMProvider / Gateway.** Their `LLMProvider` CRD is a
 discriminated union across five backends (Anthropic, GoogleCloudVertex,
 OpenAI, AzureOpenAI, AWSBedrock) with per-backend config structs,
 CEL validation ensuring exactly one is set, and credential management
 via Secret references. This is richer than what we have designed and
-satisfies our requirements. We could adopt it.
+satisfies our requirements. We have renamed our equivalent to Gateway
+(one provider/model combination per CR) to align with the OpenShell
+gateway model, but the underlying concern is the same.
 
 **Gap 1: Agent as a reusable capability template.** We need the Agent
 to define the full execution environment — a container image (runtime
@@ -1381,9 +1378,11 @@ interested in generalizing these primitives — enriching Agent to
 carry image, prompt, and skills; supporting multiple skill images;
 and introducing a generic execution resource below Proposal — we
 would collaborate on shared CRD definitions and controllers. Their
-`LLMProvider` is a strong starting point. Until such collaboration
-materializes, we define our own primitives under `konveyor.io` to
-avoid blocking on external alignment.
+`LLMProvider` is a strong starting point for the Gateway concern
+(we have renamed ours to Gateway to align with the OpenShell
+gateway model). Until such collaboration materializes, we define
+our own primitives under `konveyor.io` to avoid blocking on
+external alignment.
 
 ### Hub adapter in the controller
 
