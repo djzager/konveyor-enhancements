@@ -638,7 +638,13 @@ kubectl get gateways
 8. UI polls AgentRun status; connects via ACP WebSocket for streaming
 9. On completion: shows branch link
 
-#### Story 3: CLI user runs an agent against any repo
+#### Story 3: CLI user runs an agent against any repo (future)
+
+The CRDs support this — the controller passes params through
+without interpretation. However, the current Konveyor harness
+requires Hub for git credential resolution. This story requires
+either a standalone harness or extending the current harness with
+a non-Hub path.
 
 ```bash
 kubectl apply -f - <<EOF
@@ -662,7 +668,8 @@ spec:
 EOF
 ```
 
-No Hub, no application inventory. Just a repo and an agent.
+No Hub, no application inventory. Just a repo, an agent, and a
+harness that supports this path.
 
 ### Implementation Details
 
@@ -881,7 +888,17 @@ coordinates and credentials from Hub at runtime. The UI only
 renders form fields for params the user actually decides (here,
 just `target_framework`).
 
-**Standalone Agent** (no managed label):
+**Standalone Agent** (future — not implemented in the current harness):
+
+The controller and CRDs are domain-agnostic, so nothing prevents
+a non-Hub agent. However, the current Konveyor harness
+(`migration-harness`) is migration-specific and requires
+`HUB_BASE_URL` + `APP_ID` — it resolves git coordinates and
+credentials from Hub at runtime. A standalone path would require
+either extending the Konveyor harness to support a non-Hub mode
+or providing a different harness in the base image.
+
+The CRD shape that would support a standalone agent:
 
 ```yaml
 apiVersion: konveyor.io/v1alpha1
@@ -889,7 +906,7 @@ kind: Agent
 metadata:
   name: java-migration-agent-standalone
 spec:
-  image: quay.io/konveyor/agent-java-goose:latest
+  image: quay.io/example/agent-with-standalone-harness:latest
   prompt: "You are a Java migration specialist..."
   gateways:
     - ref: anthropic-sonnet
@@ -910,17 +927,23 @@ spec:
       default: quarkus-3
 ```
 
-Same image, same prompt, same skills. The caller supplies git
-coordinates directly as params and credentials via `envFrom`.
+Note: this uses a different image carrying a harness that reads
+git coordinates from `KONVEYOR_PARAM_*` env vars and credentials
+from mounted Secrets (via `envFrom`). The Konveyor harness does
+not support this path today. The controller passes params through
+without interpretation regardless of which harness the image
+carries.
 
 ##### Harness behavior
 
-The harness (`/usr/local/bin/konveyor-harness`) in the base image
-acts as a Hub client in managed mode — the same role that the
-addon adapter (`shared/addon/adapter`) plays for addons today.
+The Konveyor harness (`migration-harness`) in the base image is
+migration-specific — it acts as a Hub client, the same role that
+the addon adapter (`shared/addon/adapter`) plays for addons today.
+`HUB_BASE_URL` and `APP_ID` are required env vars; the harness
+will not start without them.
 
-**Managed mode** (`HUB_BASE_URL` + `HUB_APP_ID` present):
-1. Reads `HUB_APP_ID` and `HUB_BASE_URL` from env
+**Current behavior** (Hub-only):
+1. Reads `APP_ID` and `HUB_BASE_URL` from env
 2. Calls `GET /applications/<id>` — gets git URL, branch
 3. Calls `GET /identities/<id>?decrypted=1` — gets credentials
 4. Clones the repo, configures workspace so the agent cannot push
@@ -929,15 +952,17 @@ addon adapter (`shared/addon/adapter`) plays for addons today.
 6. On exit (success or failure): revokes the Hub API token, then
    exits
 
-**Standalone mode** (`HUB_BASE_URL` not present):
-1. Reads `KONVEYOR_PARAM_SOURCE_URL`, `KONVEYOR_PARAM_BRANCH`,
-   `KONVEYOR_PARAM_TARGET_BRANCH` from env
-2. Reads git credentials from mounted Secrets (via `envFrom`)
-3. Clones the repo, configures workspace
-4. Launches the agent runtime
+The harness commits work incrementally and pushes to the target
+branch on exit.
 
-In both modes, the harness commits work incrementally and pushes
-to the target branch on exit.
+**Future: standalone harness.** The controller is domain-agnostic
+and passes params through without interpretation, so nothing
+prevents a different harness that reads git coordinates from
+`KONVEYOR_PARAM_*` env vars and credentials from mounted Secrets
+instead of calling Hub. This would be either a separate binary in
+a different base image, or an extension of the current harness
+with a conditional path when `HUB_BASE_URL` is absent. This is
+not in scope for the current implementation.
 
 ##### Token lifecycle
 
